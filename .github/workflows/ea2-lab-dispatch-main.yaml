@@ -1,4 +1,10 @@
-name: Despliegue EA2
+# ─────────────────────────────────────────────────────────────
+# Disparador en rama default (main): GitHub solo lista en Actions
+# los workflows que existen en la rama por defecto del repo.
+#
+# Este archivo delega en la receta de provisión en el mismo repositorio (@main).
+# ─────────────────────────────────────────────────────────────
+name: Ej K8S desde alumno
 on:
   workflow_dispatch:
     inputs:

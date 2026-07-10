@@ -1,0 +1,122 @@
+# ─────────────────────────────────────────────────────────────
+# Receta compartida: "desplegar en el color inactivo, validar salud,
+# y solo entonces mover el tráfico de producción" (Blue-Green)
+#
+# Requiere que el cluster ya tenga el bootstrap inicial aplicado:
+#   demo-api-blue (Deployment), demo-api-green (Deployment),
+#   demo-api / demo-api-blue-probe / demo-api-green-probe (Services)
+# ─────────────────────────────────────────────────────────────
+name: Deploy Blue-Green a K3S (receta reutilizable)
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Nombre de la imagen en Docker Hub (sin el usuario)
+        required: true
+        type: string
+      image-tag:
+        description: Etiqueta de esta versión (ej. v1.2.3)
+        required: true
+        type: string
+      k3s-server-public-ip:
+        description: IP pública del servidor K3S
+        required: true
+        type: string
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      EA2_SSH_PRIVATE_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+      k3s-server-public-ip:
+        required: true
+        type: string
+
+jobs:
+  deploy-blue-green:
+    name: Deploy Blue-Green + health check + rollback
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1 · Descargar el código del repositorio (manifiestos k8s/)
+        uses: actions/checkout@v4
+
+      - name: 2 · Cargar clave SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: 3 · Copiar manifiestos k8s/ al servidor
+        run: |
+          set -euo pipefail
+          test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} 'sudo rm -rf /tmp/k8s-deploy'
+          scp -o StrictHostKeyChecking=accept-new -r k8s ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy
+
+      - name: 4 · Determinar color activo y color objetivo
+        id: colors
+        run: |
+          set -euo pipefail
+          CURRENT=$(ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} \
+            "sudo k3s kubectl get service demo-api -o jsonpath='{.spec.selector.version}'")
+          if [ "$CURRENT" = "blue" ]; then
+            TARGET=green; TARGET_PORT=30092
+          else
+            TARGET=blue; TARGET_PORT=30091
+          fi
+          echo "Color activo actual: $CURRENT → Desplegando en: $TARGET"
+          echo "current=$CURRENT"      >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET"        >> "$GITHUB_OUTPUT"
+          echo "target_port=$TARGET_PORT" >> "$GITHUB_OUTPUT"
+
+      - name: 5 · Desplegar nueva versión en el color inactivo
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
+            sudo k3s kubectl apply -f /tmp/k8s-deploy/demo-api-${{ steps.colors.outputs.target }}.yaml &&
+            sudo k3s kubectl apply -f /tmp/k8s-deploy/demo-api-service.yaml &&
+            sudo k3s kubectl set image deployment/demo-api-${{ steps.colors.outputs.target }} \
+              api=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }} &&
+            sudo k3s kubectl rollout status deployment/demo-api-${{ steps.colors.outputs.target }} --timeout=60s
+          "
+
+      - name: 6 · Validación de salud (gate) sobre el color inactivo
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          OK=0
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${{ inputs.k3s-server-public-ip }}:${{ steps.colors.outputs.target_port }}/health" || echo "000")
+            echo "Intento $i → HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then OK=1; break; fi
+            sleep 3
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::Health check falló tras 10 intentos"
+            exit 1
+          fi
+
+      - name: 7 · Mover tráfico de producción al nuevo color (switch)
+        if: steps.healthcheck.outcome == 'success'
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
+            sudo k3s kubectl patch service demo-api \
+              -p '{\"spec\":{\"selector\":{\"app\":\"demo-api\",\"version\":\"${{ steps.colors.outputs.target }}\"}}}'
+          "
+          echo "✅ Tráfico movido a ${{ steps.colors.outputs.target }}. Color anterior (${{ steps.colors.outputs.current }}) queda como respaldo."
+
+      - name: 8 · ROLLBACK automático (el health check falló)
+        if: steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "❌ Health check falló — el color activo sigue siendo ${{ steps.colors.outputs.current }}, no se movió tráfico."
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
+            sudo k3s kubectl rollout undo deployment/demo-api-${{ steps.colors.outputs.target }}
+          "
+          exit 1

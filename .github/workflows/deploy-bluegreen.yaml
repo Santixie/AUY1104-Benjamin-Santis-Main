@@ -52,10 +52,12 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
 
-      - name: 3 · Copiar manifiestos k8s/ al servidor
+      - name: 3 · Inyectar imagen dinámica en los manifiestos y copiarlos al servidor
         run: |
           set -euo pipefail
           test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
+          IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}"
+          sed -i "s|__IMAGE__|${IMAGEN_COMPLETA}|g" k8s/demo-api-blue.yaml k8s/demo-api-green.yaml
           ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} 'sudo rm -rf /tmp/k8s-deploy'
           scp -o StrictHostKeyChecking=accept-new -r k8s ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy
 
@@ -82,8 +84,6 @@ jobs:
           ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
             sudo k3s kubectl apply -f /tmp/k8s-deploy/demo-api-${{ steps.colors.outputs.target }}.yaml &&
             sudo k3s kubectl apply -f /tmp/k8s-deploy/demo-api-service.yaml &&
-            sudo k3s kubectl set image deployment/demo-api-${{ steps.colors.outputs.target }} \
-              api=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }} &&
             sudo k3s kubectl rollout status deployment/demo-api-${{ steps.colors.outputs.target }} --timeout=60s
           "
 
@@ -121,10 +121,4 @@ jobs:
           if [ "${{ steps.deploy.outcome }}" = "failure" ]; then
             echo "❌ El rollout de ${{ steps.colors.outputs.target }} no llegó a Ready (probe falló) — revirtiendo."
           else
-            echo "❌ El health check del pipeline falló — revirtiendo ${{ steps.colors.outputs.target }}."
-          fi
-          echo "El color activo sigue siendo ${{ steps.colors.outputs.current }}, no se movió tráfico."
-          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
-            sudo k3s kubectl rollout undo deployment/demo-api-${{ steps.colors.outputs.target }}
-          "
-          exit 1
+            echo "❌ El health check del pipeline falló — revirtiendo ${{

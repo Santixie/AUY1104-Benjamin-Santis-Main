@@ -76,6 +76,8 @@ jobs:
           echo "target_port=$TARGET_PORT" >> "$GITHUB_OUTPUT"
 
       - name: 5 · Desplegar nueva versión en el color inactivo
+        id: deploy
+        continue-on-error: true
         run: |
           ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
             sudo k3s kubectl apply -f /tmp/k8s-deploy/demo-api-${{ steps.colors.outputs.target }}.yaml &&
@@ -87,6 +89,7 @@ jobs:
 
       - name: 6 · Validación de salud (gate) sobre el color inactivo
         id: healthcheck
+        if: steps.deploy.outcome == 'success'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -104,7 +107,7 @@ jobs:
           fi
 
       - name: 7 · Mover tráfico de producción al nuevo color (switch)
-        if: steps.healthcheck.outcome == 'success'
+        if: steps.deploy.outcome == 'success' && steps.healthcheck.outcome == 'success'
         run: |
           ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
             sudo k3s kubectl patch service demo-api \
@@ -112,10 +115,15 @@ jobs:
           "
           echo "✅ Tráfico movido a ${{ steps.colors.outputs.target }}. Color anterior (${{ steps.colors.outputs.current }}) queda como respaldo."
 
-      - name: 8 · ROLLBACK automático (el health check falló)
-        if: steps.healthcheck.outcome == 'failure'
+      - name: 8 · ROLLBACK automático (el rollout o el health check fallaron)
+        if: steps.deploy.outcome == 'failure' || steps.healthcheck.outcome == 'failure'
         run: |
-          echo "❌ Health check falló — el color activo sigue siendo ${{ steps.colors.outputs.current }}, no se movió tráfico."
+          if [ "${{ steps.deploy.outcome }}" = "failure" ]; then
+            echo "❌ El rollout de ${{ steps.colors.outputs.target }} no llegó a Ready (probe falló) — revirtiendo."
+          else
+            echo "❌ El health check del pipeline falló — revirtiendo ${{ steps.colors.outputs.target }}."
+          fi
+          echo "El color activo sigue siendo ${{ steps.colors.outputs.current }}, no se movió tráfico."
           ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
             sudo k3s kubectl rollout undo deployment/demo-api-${{ steps.colors.outputs.target }}
           "

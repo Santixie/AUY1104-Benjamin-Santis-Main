@@ -121,4 +121,10 @@ jobs:
           if [ "${{ steps.deploy.outcome }}" = "failure" ]; then
             echo "❌ El rollout de ${{ steps.colors.outputs.target }} no llegó a Ready (probe falló) — revirtiendo."
           else
-            echo "❌ El health check del pipeline falló — revirtiendo ${{
+            echo "❌ El health check del pipeline falló — revirtiendo ${{ steps.colors.outputs.target }}."
+          fi
+          echo "El color activo sigue siendo ${{ steps.colors.outputs.current }}, no se movió tráfico."
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@${{ inputs.k3s-server-public-ip }} "
+            sudo k3s kubectl rollout undo deployment/demo-api-${{ steps.colors.outputs.target }}
+          "
+          exit 1
